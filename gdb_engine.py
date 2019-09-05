@@ -75,10 +75,13 @@ def get_xul_version():
 def get_arch():
     # get the start of text
     text_addr = None
-    for l in execute("info proc stat").split("\n"):
-        if l.startswith("Start of text:"):
-            text_addr = int(l.split(":")[1], 16)
-            break
+    try:
+        for l in execute("info proc stat").split("\n"):
+            if l.startswith("Start of text:"):
+                text_addr = int(l.split(":")[1], 16)
+                break
+    except gdb.error:
+        return "Aarch64"
 
     # raise exception?
     if text_addr is None:
