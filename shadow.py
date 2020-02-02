@@ -416,40 +416,47 @@ def parse_general(jeheap):
 def parse_arenas(jeheap):
     global arenas_addr
 
-    dword_size = dbg.get_dword_size()
-    bin_size = dbg.sizeof('arena_bin_t')
     for i in range(0, jeheap.narenas):
-        cur_arena_addr = arenas_addr[i]
-        cur_arena_bins_addr = cur_arena_addr + dbg.offsetof('arena_t', 'bins')
-
-        if cur_arena_addr == 0:
+        new_arena_addr = arenas_addr[i]
+        if new_arena_addr == 0:
             continue
 
-        bins_mem = dbg.read_bytes(cur_arena_bins_addr,
-                                  jeheap.nbins * bin_size)
+        new_arena = parse_arena(new_arena_addr, i, jeheap.nbins)
 
-        bins_mem = [bins_mem[z:z+bin_size]
-                    for z in range(0, jeheap.nbins * bin_size, bin_size)]
+        # Add arena to the list of arenas
+        jeheap.arenas.append(new_arena)
 
-        cur_arena = jemalloc.arena(cur_arena_addr, i, [], [], [])
-        for j in range(0, jeheap.nbins):
-            bin_addr = cur_arena_bins_addr + bin_size * j
 
-            buf = bins_mem[j]
-            runcur_addr = dbg.read_struct_member(buf, "arena_bin_t",
-                                                 "runcur", dword_size)
+def parse_arena(addr, index, nbins):
+    new_arena = jemalloc.arena(addr, index, [], [], [])
 
-            # associate run address with run object
-            if runcur_addr == 0:
-                run = None
-            else:
-                run = jeheap.runs[str(runcur_addr)]
+    # Read the array of bins
+    bin_size = dbg.sizeof('arena_bin_t')
+    bins_addr = addr + dbg.offsetof('arena_t', 'bins')
+    bins_mem = dbg.read_bytes(bins_addr, nbins * bin_size)
+    bins_mem = [bins_mem[z:z+bin_size]
+                    for z in range(0, nbins * bin_size, bin_size)]
 
-            # create new bin object
-            cur_arena.bins.append(jemalloc.arena_bin(bin_addr, j, run))
+    # Now parse each bin
+    for j in range(0, nbins):
+        bin_addr = bins_addr + bin_size * j
+        buf = bins_mem[j]
+        new_arena.bins.append(parse_arena_bin(bin_addr, j, buf))
 
-        # add arena to the list of arenas
-        jeheap.arenas.append(copy.deepcopy(cur_arena))
+    return new_arena
+
+
+def parse_arena_bin(addr, index, data):
+    dword_size = dbg.get_dword_size()
+    runcur = dbg.read_struct_member(data, "arena_bin_t", "runcur", dword_size)
+
+    # associate run address with run object
+    if runcur == 0:
+        run = None
+    else:
+        run = jeheap.runs[str(runcur)]
+
+    return jemalloc.arena_bin(addr, index, run)
 
 
 def parse_run(jeheap, hdr_addr, addr, run_hdr, run_size, binind, read_content_preview):
@@ -538,6 +545,7 @@ def parse_all_runs(jeheap, read_content_preview):
                           + dbg.offsetof('extent_node_t', 'en_arena')
         map_misc_offset = dbg.to_int(dbg.get_value('je_map_misc_offset'))
         arena_run_bin_off = None
+        map_bias = int_from_sym(['je_map_bias'])
 
     # the arena_run_t header is stored at the hdr_addr of each run in
     # the firefox version
@@ -548,14 +556,10 @@ def parse_all_runs(jeheap, read_content_preview):
         chunk_arena_off = dbg.offsetof('arena_chunk_t', 'arena')
         map_misc_offset = None
         arena_run_bin_off = dbg.offsetof('arena_run_t', 'bin')
+        map_bias = 0
 
     arena_bin_size = dbg.sizeof('arena_bin_t')
     bins_offset = dbg.offsetof('arena_t', 'bins')
-
-    if jeheap.standalone:
-        map_bias = int_from_sym(['je_map_bias'])
-    else:
-        map_bias = 0
 
     chunk_npages = jeheap.chunk_size >> 12
     bitmap_len = (chunk_npages - map_bias) * chunk_map_dwords
@@ -601,17 +605,21 @@ def parse_all_runs(jeheap, read_content_preview):
         i = -1
         for mapelm in bitmap:
             i += 1
+            unallocated = False
             debug_log("    [%04d] mapelm = 0x%x" % (i, mapelm))
-            # small run
-            if mapelm & 0xf == 1:
-                if jeheap.standalone:
+
+            # standalone version
+            if jeheap.standalone:
+                # small run
+                if mapelm & 0xf == 1:
                     debug_log("      small run")
 
                     if android_version == '6':
                         offset = mapelm & ~flags_mask
+                        binind = (mapelm & 0xFF0) >> 4
                     elif android_version == '7' or android_version == '8':
-                        # offset = (mapelm >> 13) << 12
                         offset = (mapelm & ~0x1FFF) >> 1
+                        binind = (mapelm & 0x1FE0) >> 5
 
                     debug_log("      offset = 0x%x" % offset)
 
@@ -619,37 +627,58 @@ def parse_all_runs(jeheap, read_content_preview):
                     if offset != 0:
                         continue
 
-                    map_misc_addr = chunk.addr + map_misc_offset
-
-                    cur_arena_chunk_map_misc = map_misc_addr + \
-                                               i * dbg.sizeof('arena_chunk_map_misc_t')
-
-                    hdr_addr = cur_arena_chunk_map_misc + \
-                               dbg.offsetof('arena_chunk_map_misc_t', 'run')
-                    debug_log("    hdr_addr = 0x%x" % hdr_addr)
-
-                    run_hdr_off = map_misc_offset \
-                                  + i * dbg.sizeof('arena_chunk_map_misc_t') \
-                                  + dbg.offsetof('arena_chunk_map_misc_t', 'run')
-
-                    run_hdr = chunk_mem[run_hdr_off:
-                                        run_hdr_off + dbg.sizeof("arena_run_t")]
-
-
-
-                    # decode the bin index
-                    if android_version == '6':
-                        binind = (mapelm & 0xFF0) >> 4
-                    elif android_version== '7' or android_version == '8':
-                        binind = (mapelm & 0x1FE0) >> 5
                     debug_log("      binind = 0x%x" % binind)
-
 
                     size = jeheap.bin_info[binind].run_size
                     debug_log("      size = 0x%x" % size)
 
-                # firefox
+                # large run
+                elif mapelm & 0xf == 3:
+                    debug_log("      large run")
+
+                    if android_version == '6':
+                        size = mapelm & ~flags_mask
+                    elif android_version == '7' or android_version == '8':
+                        size = (mapelm & ~0x1FFF) >> 1
+
+                    binind = 0xff
+                    debug_log("      size = 0x%x" % size)
+
+                # unallocated run
                 else:
+                    debug_log("      unallocated run")
+
+                    if android_version == '6':
+                        size = mapelm & ~flags_mask
+                    elif android_version == '7' or android_version == '8':
+                        size = (mapelm & ~0x1FFF) >> 1
+
+                    unallocated = True
+                    binind = 0xff
+                    debug_log("      size = 0x%x" % size)
+
+                map_misc_addr = chunk.addr + map_misc_offset
+
+                cur_arena_chunk_map_misc = map_misc_addr + \
+                                           i * dbg.sizeof('arena_chunk_map_misc_t')
+
+                hdr_addr = cur_arena_chunk_map_misc + \
+                           dbg.offsetof('arena_chunk_map_misc_t', 'run')
+
+                debug_log("      run_hdr = 0x%x" % hdr_addr)
+
+                run_hdr_off = map_misc_offset \
+                              + i * dbg.sizeof('arena_chunk_map_misc_t') \
+                              + dbg.offsetof('arena_chunk_map_misc_t', 'run')
+
+                run_hdr = chunk_mem[run_hdr_off:
+                                    run_hdr_off + dbg.sizeof("arena_run_t")]
+                addr =  chunk.addr + (i + map_bias) * dbg.get_page_size()
+
+            # Firefox
+            else:
+                # small run
+                if mapelm & 0xf == 1:
                     hdr_addr = mapelm & ~flags_mask
                     off = hdr_addr - chunk.addr
 
@@ -670,63 +699,32 @@ def parse_all_runs(jeheap, read_content_preview):
                     run_hdr = chunk_mem[off:
                                         off + run_hdr_sz]
 
-            # large run
-            elif mapelm & 0xf == 3:
-                if jeheap.standalone:
-                    debug_log("      large run")
-                    map_misc_addr = chunk.addr + map_misc_offset
-
-                    cur_arena_chunk_map_misc = map_misc_addr + \
-                                               i * dbg.sizeof('arena_chunk_map_misc_t')
-
-                    hdr_addr = cur_arena_chunk_map_misc + \
-                               dbg.offsetof('arena_chunk_map_misc_t', 'run')
-
-                    debug_log("      run_hdr = 0x%x" % hdr_addr)
-
-                    run_hdr_off = map_misc_offset \
-                                  + i * dbg.sizeof('arena_chunk_map_misc_t') \
-                                  + dbg.offsetof('arena_chunk_map_misc_t', 'run')
-
-                    run_hdr = chunk_mem[run_hdr_off:
-                                        run_hdr_off + dbg.sizeof("arena_run_t")]
-
-
-                    if android_version == '6':
-                        size = mapelm & ~flags_mask
-                    elif android_version == '7' or android_version == '8':
-                        size = (mapelm & ~0x1FFF) >> 1
-                    debug_log("      size = 0x%x" % size)
-
-                # firefox
-                else:
+                # large run
+                elif mapelm & 0xf == 3:
                     hdr_addr = chunk.addr + i * dbg.get_page_size()
                     off = hdr_addr - chunk.addr
                     run_hdr = chunk_mem[off:
                                         off + dbg.sizeof("arena_run_t")]
 
                     size = mapelm & ~flags_mask
+                    binind = 0xff
 
-                binind = 0xff
+                # unallocated run
+                else:
+                    debug_log("      unallocated page")
+                    continue
 
-            # unallocated run
-            else:
-                debug_log("      unallocated page")
-                continue
+                addr = hdr_addr
 
             if hdr_addr == 0 or size == 0:
                 debug_log("      hdr_addr or size is 0, skipping")
                 continue
-
-            if jeheap.standalone:
-                addr =  chunk.addr + (i + map_bias) * dbg.get_page_size()
-            # firefox
-            else:
-                addr = hdr_addr
-
             debug_log("      addr = 0x%x" % addr)
-            jeheap.runs[str(hdr_addr)] = parse_run(jeheap, hdr_addr, addr, run_hdr,
-                                                   size, binind, read_content_preview)
+
+            new_run = parse_run(jeheap, hdr_addr, addr, run_hdr, size, binind,
+                                read_content_preview)
+            new_run.unallocated = unallocated
+            jeheap.runs[str(hdr_addr)] = new_run
 
             chunk.runs.append(hdr_addr)
 
@@ -1506,27 +1504,39 @@ def dump_runs(dump_current_runs=False, size_class=0):
         for i in range(0, len(jeheap.arenas)):
             print("* arena[%d]" % i)
             print("")
-            table = [("region size", "run address", "run size", "usage")]
+            table = [("region size", "run address", "run size", "usage", "allocated")]
 
             for j in range(0, len(jeheap.arenas[i].bins)):
                 run = jeheap.arenas[i].bins[j].runcur
                 if run is None:
                     run_addr = "-"
                     run_size = "-"
-                    run_usage = '-'
+                    run_usage = "-"
+                    run_alloc = "-"
+
+                elif run.unallocated:
+                    run_addr = hex(run.addr)
+                    run_size = hex(jeheap.bin_info[j].run_size)
+                    no_free = "-"
+                    no_regions = "-"
+                    run_usage = "-"
+                    run_alloc = "false"
+
                 else:
                     run_addr = hex(run.addr)
                     run_size = hex(jeheap.bin_info[j].run_size)
                     no_free = run.nfree
                     no_regions = jeheap.bin_info[j].nregs
                     run_usage = "%d/%d" % (no_regions - no_free, no_regions)
+                    run_alloc = "true"
 
                 reg_size = hex(jeheap.bin_info[j].reg_size)
                 if size_class == 0 or size_class == jeheap.bin_info[j].reg_size:
                     table.append((reg_size,
                                   run_addr,
                                   run_size,
-                                  run_usage))
+                                  run_usage,
+                                  run_alloc))
 
             print(ascii_table(table))
 
@@ -1540,28 +1550,37 @@ def dump_runs(dump_current_runs=False, size_class=0):
 
             i += 1
             if size_class == 0:
+                # unallocated run
+                if run.unallocated:
+                    table.append([i,
+                                  hex(run.addr),
+                                  hex(run.size),
+                                  "-", "-", "-", "unallocated"])
+
                 # large run
-                if run.binind in [0xff, 0x1fe0]:
-                        table.append([i,
-                                      hex(run.addr),
-                                      hex(run.size),
-                                      "-", "-", "-"])
+                elif run.binind in [0xff, 0x1fe0]:
+                    table.append([i,
+                                  hex(run.addr),
+                                  hex(run.size),
+                                  "-", "-", "-", "large"])
 
                 # small run
                 else:
-                        table.append([i,
-                                      hex(run.addr),
-                                      hex(run.size),
-                                      hex(jeheap.bin_info[run.binind].reg_size),
-                                      jeheap.bin_info[run.binind].nregs,
-                                      run.nfree])
+                    table.append([i,
+                                  hex(run.addr),
+                                  hex(run.size),
+                                  hex(jeheap.bin_info[run.binind].reg_size),
+                                  jeheap.bin_info[run.binind].nregs,
+                                  run.nfree,
+                                  "small"])
             elif not run.binind in [0xff, 0x1fe0] and size_class == jeheap.bin_info[run.binind].reg_size:
                 table.append([i,
-                                hex(run.addr),
-                                hex(run.size),
-                                hex(jeheap.bin_info[run.binind].reg_size),
-                                jeheap.bin_info[run.binind].nregs,
-                                run.nfree])
+                              hex(run.addr),
+                              hex(run.size),
+                              hex(jeheap.bin_info[run.binind].reg_size),
+                              jeheap.bin_info[run.binind].nregs,
+                              run.nfree,
+                              "large"])
 
         table = sorted(table, key=lambda x: x[1])
 
@@ -1570,7 +1589,7 @@ def dump_runs(dump_current_runs=False, size_class=0):
             line[0] = i
             i += 1
 
-        table = [("*", "run_addr", "run_size", "region_size", "no_regions", "no_free")] + table
+        table = [("*", "run_addr", "run_size", "region_size", "no_regions", "no_free", "type")] + table
         print(ascii_table(table))
 
 
